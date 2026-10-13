@@ -1,5 +1,14 @@
+# generated
 index.pkl
+data/
+data_excel/
 __pycache__/
 *.pyc
+
+# local / editor
 .venv/
-data_real/
+venv/
+.env
+.vscode/
+.idea/
+~$*.xlsx

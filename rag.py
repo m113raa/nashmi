@@ -2,9 +2,15 @@
 rag.py - Arabic RAG core (Ollama + command-r7b-arabic + bge-m3), hybrid search, ID lookup tool.
 
 Commands:
-  python rag.py ingest [data_dir]   build the index from every .md/.txt/.csv/.json/.pdf/.docx in data_dir
+  python rag.py ingest [data_dir]   build the index from every .xlsx/.xls/.csv/.json/.md/.txt/.pdf/.docx in data_dir
   python rag.py ask "سؤالك"         ask one question in the terminal
-  python rag.py eval                run data/eval_questions.json and print a score
+  python rag.py eval [data_dir]     run the test questions (eval_questions.json or an Excel 'eval...' sheet)
+
+Excel: every sheet is read as a table (header row found automatically, IDs and dates cleaned).
+       Sheets named README / notes / eval... are not indexed. A cell longer than 400 characters
+       (or a multi-line cell over 150) is treated as a document and chunked, so a sheet of
+       procedure texts works too.
+       Put the Excel file alone in its folder, not next to CSV copies of the same data.
 UI:   streamlit run ui.py
 
 Offline dev mode (no Ollama needed, for UI work):  set RAG_FAKE=1
@@ -16,10 +22,16 @@ import numpy as np
 
 LLM_MODEL = os.getenv("LLM_MODEL", "command-r7b-arabic")
 EMB_MODEL = os.getenv("EMB_MODEL", "bge-m3")
-DATA_DIR = os.getenv("DATA_DIR", "data")
+DATA_DIR = os.getenv("DATA_DIR", "data_excel")
 INDEX_PATH = os.getenv("INDEX_PATH", "index.pkl")
-TOP_K = int(os.getenv("TOP_K", "6"))
+TOP_K = int(os.getenv("TOP_K", "5"))
 FAKE = os.getenv("RAG_FAKE") == "1"
+# "fast" (default) = keyword search only: ingest takes seconds, and Ollama never has to swap
+#                    the embedding model and the chat model in and out of memory on each question.
+# "hybrid"         = keyword + bge-m3 semantic search: better for loosely worded questions, much slower on CPU.
+SEARCH_MODE = os.getenv("SEARCH_MODE", "fast")
+# Set NUM_GPU=0 to run the model on the CPU only (fixes "CUDA error" crashes on some laptops; slower)
+NUM_GPU = os.getenv("NUM_GPU")
 
 # ------------------------------------------------------------------ 1. Arabic normalization
 _DIACRITICS = re.compile(r"[ؐ-ًؚ-ٰٟۖ-ۭـ]")  # tashkeel + tatweel
@@ -37,8 +49,55 @@ STOP = set(normalize(w) for w in """في من على الى إلى عن ما م�
 شو قديش وين ليش كيف بدي اللي الذي التي يا مع كل بعد قبل لا لم لن""".split())
 
 
-def tokenize(text):
-    return [w for w in re.findall(r"[\w]+", normalize(text)) if w not in STOP and len(w) > 1]
+_PREFIXES = ("وال", "بال", "كال", "فال", "لل", "ال")  # one-letter prefixes are handled in tokenize()
+_SUFFIXES = ("هما", "تين", "تها", "ها", "هم", "كم", "نا", "تي", "ات", "ون", "ين", "يه", "ه", "ي", "ك")
+
+
+def stem(w):
+    """Light Arabic stemming so هويتي / الهوية / هويه all become the same search word."""
+    if w.isdigit() or len(w) < 4:
+        return w
+    for p in _PREFIXES:
+        if w.startswith(p) and len(w) - len(p) >= 3:
+            w = w[len(p):]
+            break
+    for s in _SUFFIXES:
+        if w.endswith(s) and len(w) - len(s) >= 3:
+            w = w[:-len(s)]
+            break
+    return w
+
+
+# Everyday / dialect words people type -> the words used in the official documents
+SYNONYMS = {
+    "هويه": "بطاقه احوال", "هويتي": "بطاقه احوال", "الهويه": "بطاقه احوال", "بطاقتي": "بطاقه",
+    "ضاعت": "فاقد فقدان", "ضايعه": "فاقد", "فقدت": "فاقد فقدان", "انسرقت": "فاقد", "خربت": "تالف", "انكسرت": "تالف",
+    "مولود": "ولاده تسجيل", "مواليد": "ولاده", "ابني": "ولاده", "بنتي": "ولاده", "طفل": "ولاده",
+    "مات": "وفاه", "توفي": "وفاه", "متوفي": "وفاه", "وفاته": "وفاه",
+    "اوراق": "الوثائق المطلوبه", "الاوراق": "الوثائق المطلوبه", "ورق": "الوثائق",
+    "قديش": "رسوم", "سعر": "رسوم", "تكلفه": "رسوم", "بكم": "رسوم", "ادفع": "رسوم",
+    "دوام": "ساعات الدوام", "بفتحو": "ساعات الدوام", "يفتح": "ساعات الدوام",
+    "تزوجت": "زواج", "اتجوز": "زواج", "اطلق": "طلاق", "طلقت": "طلاق",
+    "اسمي": "تغيير الاسم", "اغير": "تغيير تصحيح",
+    "اجدد": "تجديد", "جدد": "تجديد", "يجدد": "تجديد", "بجدد": "تجديد", "منتهيه": "تجديد انتهاء", "خلصت": "تجديد انتهاء",
+    "اطلع": "اصدار", "اسجل": "تسجيل", "بسجل": "تسجيل",
+}
+
+
+def tokenize(text, expand=False):
+    words = re.findall(r"[\w]+", normalize(text))
+    if expand:  # only for questions: add the official wording for dialect words
+        words += [x for w in words for x in SYNONYMS.get(w, "").split()]
+    out = []
+    for w in words:
+        if w in STOP or len(w) < 2:
+            continue
+        out.append(stem(w))
+        # و ب ل ف ك glued to the front (لبطاقة, وبدي): also index the word without it.
+        # Done as an extra token, not a replacement, so real words like فاقد / بطاقة stay intact.
+        if len(w) >= 5 and w[0] in "وبلفك" and not w.startswith("ال"):
+            out.append(stem(w[1:]))
+    return out
 
 
 # ------------------------------------------------------------------ 2. Loading + chunking
@@ -62,31 +121,125 @@ def row_to_text(row: dict) -> str:
     return "\n".join(f"{k}: {v}" for k, v in row.items() if str(v).strip())
 
 
+def read_text_file(path):
+    """Arabic files from government systems are often Windows-1256, not UTF-8. Try both."""
+    for enc in ("utf-8-sig", "cp1256"):
+        try:
+            with open(path, encoding=enc) as f:
+                return f.read()
+        except UnicodeDecodeError:
+            continue
+    with open(path, encoding="utf-8", errors="replace") as f:
+        return f.read()
+
+
 def load_table_rows(path):
-    if path.endswith(".csv"):
-        with open(path, encoding="utf-8-sig") as f:
-            return list(csv.DictReader(f))
+    if path.lower().endswith(".csv"):
+        import io
+        return list(csv.DictReader(io.StringIO(read_text_file(path))))
     with open(path, encoding="utf-8") as f:
         data = json.load(f)
     return data if isinstance(data, list) and data and isinstance(data[0], dict) else None
+
+
+# ---- Excel ------------------------------------------------------------------------------
+SKIP_SHEETS = ("readme", "read me", "notes", "about", "تعليمات", "ملاحظات")
+LONG_TEXT = 400  # a cell longer than this is a document (procedure text), not a field
+
+
+def cell_to_str(v):
+    """Excel stores IDs as numbers and dates as datetimes. Turn them back into clean text."""
+    import datetime
+    if v is None:
+        return ""
+    if isinstance(v, datetime.datetime):
+        return v.date().isoformat() if v.time() == datetime.time(0) else v.isoformat(sep=" ", timespec="minutes")
+    if isinstance(v, datetime.date):
+        return v.isoformat()
+    if isinstance(v, float) and v.is_integer():
+        return str(int(v))  # 9040250165.0 -> "9040250165", never "9.04e9"
+    return str(v).strip()
+
+
+def read_excel_sheets(path):
+    """Yield (sheet_name, rows as dicts) for every sheet that holds a table."""
+    if path.lower().endswith(".xls"):
+        import pandas as pd  # old .xls needs pandas + xlrd
+        for sheet, df in pd.read_excel(path, sheet_name=None, header=None, dtype=object).items():
+            yield sheet, table_from_grid(df.where(df.notna(), None).values.tolist())
+        return
+    from openpyxl import load_workbook
+    wb = load_workbook(path, read_only=True, data_only=True)  # data_only: formula results, not formulas
+    for ws in wb.worksheets:
+        yield ws.title, table_from_grid(list(ws.iter_rows(values_only=True)))
+    wb.close()
+
+
+def table_from_grid(grid):
+    """Find the header row (first row in the top 10 with 2+ filled cells), then build row dicts."""
+    grid = [[cell_to_str(c) for c in row] for row in grid]
+    grid = [r for r in grid if any(r)]
+    if not grid:
+        return []
+    h_idx = next((i for i, r in enumerate(grid[:10]) if sum(1 for c in r if c) >= 2), 0)
+    headers, seen = [], Counter()
+    for i, h in enumerate(grid[h_idx]):
+        h = re.sub(r"\s+", " ", h) or f"column_{i+1}"
+        seen[h] += 1
+        headers.append(h if seen[h] == 1 else f"{h}_{seen[h]}")  # duplicate header names
+    rows = []
+    for r in grid[h_idx + 1:]:
+        row = {headers[i]: (r[i] if i < len(r) else "") for i in range(len(headers))}
+        if any(row.values()):
+            rows.append(row)
+    return rows
+
+
+def load_excel(path, name):
+    chunks, records = [], []
+    for sheet, rows in read_excel_sheets(path):
+        s = sheet.strip().lower()
+        if not rows or s in SKIP_SHEETS or s.startswith("eval"):
+            continue
+        source = f"{name} › {sheet}"
+        for i, r in enumerate(rows):
+            long_cols = [k for k, v in r.items() if len(v) > LONG_TEXT or (len(v) > 150 and "\n" in v)]
+            if long_cols:  # e.g. a 'content' column with a whole procedure: chunk it like a document
+                short = [v for k, v in r.items() if k not in long_cols and v]
+                label = " | ".join(short)
+                doc_source = f"{source} › {short[0]}" if short else f"{source} › {i+1}"  # cite the doc, not just the sheet
+                for k in long_cols:
+                    for c in chunk_markdown(r[k], doc_source):
+                        c["text"] = f"{label}\n{c['text']}" if label else c["text"]
+                        chunks.append(c)
+            else:
+                chunks.append({"text": f"[{source} سجل {i+1}]\n" + row_to_text(r), "source": source, "kind": "row"})
+                records.append({"source": source, **r})
+        print(f"  {source}: {len(rows)} rows")
+    return chunks, records
 
 
 def load_documents(data_dir=DATA_DIR):
     chunks, records = [], []
     for path in sorted(glob.glob(os.path.join(data_dir, "**", "*"), recursive=True)):
         name = os.path.relpath(path, data_dir)
-        if os.path.isdir(path) or os.path.basename(path).startswith("eval_"):
+        base = os.path.basename(path)
+        if os.path.isdir(path) or base.startswith("eval_") or base.startswith("~$"):  # ~$ = Excel lock file
             continue
         ext = path.lower().rsplit(".", 1)[-1]
         try:
             if ext in ("md", "txt"):
-                chunks += chunk_markdown(open(path, encoding="utf-8").read(), name)
+                chunks += chunk_markdown(read_text_file(path), name)
+            elif ext in ("xlsx", "xlsm", "xls"):
+                c, r = load_excel(path, name)
+                chunks += c
+                records += r
             elif ext in ("csv", "json"):
                 if ext == "json" and os.path.exists(path[:-5] + ".csv"):
                     continue  # same table already loaded from CSV
                 rows = load_table_rows(path)
                 if rows is None:  # JSON that isn't a table: index it as text
-                    chunks += chunk_markdown(open(path, encoding="utf-8").read(), name)
+                    chunks += chunk_markdown(read_text_file(path), name)
                     continue
                 for i, r in enumerate(rows):
                     chunks.append({"text": f"[{name} سجل {i+1}]\n" + row_to_text(r), "source": name, "kind": "row"})
@@ -151,10 +304,14 @@ class BM25:
 def build_index(data_dir=DATA_DIR, path=INDEX_PATH):
     chunks, records = load_documents(data_dir)
     print(f"loaded {len(chunks)} chunks, {len(records)} table rows from {data_dir}")
-    vecs = embed([c["text"] for c in chunks])
+    if not chunks:
+        print("!! nothing loaded - check the folder name and that it contains .xlsx/.csv/.md files")
+        return
+    vecs = embed([c["text"] for c in chunks]) if SEARCH_MODE == "hybrid" or FAKE else None
     with open(path, "wb") as f:
-        pickle.dump({"chunks": chunks, "records": records, "vecs": vecs, "emb_model": "fake" if FAKE else EMB_MODEL}, f)
-    print(f"index saved -> {path}")
+        pickle.dump({"chunks": chunks, "records": records, "vecs": vecs, "data_dir": data_dir,
+                     "emb_model": "fake" if FAKE else (EMB_MODEL if vecs is not None else "none (fast mode)")}, f)
+    print(f"index saved -> {path}  (search mode: {SEARCH_MODE})")
 
 
 class Retriever:
@@ -163,17 +320,71 @@ class Retriever:
             d = pickle.load(f)
         self.chunks, self.records, self.vecs = d["chunks"], d["records"], d["vecs"]
         self.bm25 = BM25([tokenize(c["text"]) for c in self.chunks])
-        self.by_id = {}  # exact lookup on any column that looks like an ID
+        self.by_id = {}       # exact lookup on any column that looks like an ID
+        self.name_keys = {}   # name pieces (full / first 3 / first+father+family / first+family) -> people
+        self.families = {}    # family name -> people
+        self.family_display = {}  # normalized family -> name as written in the data (العواملة)
         for r in self.records:
-            for k, v in r.items():
-                is_id_col = "id" in k.lower() or k == "family_book_no" or "رقم" in k
-                if is_id_col and re.fullmatch(r"\d{6,}|FB\d+", str(v)):
-                    self.by_id.setdefault(str(v), []).append(r)
+            for k in id_columns(r):
+                self.by_id.setdefault(str(r[k]), []).append(r)
+            if not is_person(r):
+                continue
+            t = tuple(name_tokens(name_of(r)))
+            keys = {t, (t[0], t[-1])}
+            if len(t) >= 3:
+                keys |= {t[:3], (t[0], t[1], t[-1])}
+            for key in keys:
+                self.name_keys.setdefault(key, []).append(r)
+            fam = family_of(r)
+            if fam:
+                self.families.setdefault(fam, []).append(r)
+                self.family_display.setdefault(fam, family_label(r))
+
+    # ---- people tools ("agent tools" the answer step calls before asking the model)
+    def person(self, pid):
+        """The person row whose OWN id is pid (not rows that merely point at pid)."""
+        return next((r for r in self.by_id.get(str(pid), []) if is_person(r) and person_id(r) == str(pid)), None)
+
+    def match_names(self, query):
+        """People whose name is written in the question. Longest match wins: a full 4-part name beats
+        'first father grandfather', which beats 'first + family'. Returns every match, so duplicates show up."""
+        q = name_tokens(query)
+        for n in range(6, 1, -1):
+            found = []
+            for i in range(len(q) - n + 1):
+                key = tuple(q[i:i + n])
+                if n == 2 and key[-1] not in self.families:  # 2 words only count as "first name + family"
+                    continue
+                found += [r for r in self.name_keys.get(key, []) if r not in found]
+            if found:
+                return found
+        return []
+
+    def match_family(self, query):
+        """'كل أفراد عيلة العواملة' -> the family name, if the question asks for a family."""
+        q = name_tokens(query)
+        fams = [t for t in q if t in self.families]
+        if fams and loose_tokens(query) & FAMILY_WORDS:
+            return fams[0]
+        return None
 
     def search(self, query, k=TOP_K):
         """Hybrid = semantic (meaning) + BM25 (exact words), merged with Reciprocal Rank Fusion."""
+        sparse = self.bm25.scores(tokenize(query, expand=True))
+        if self.vecs is None:  # fast mode: keyword search only
+            order = [i for i in np.argsort(-sparse)[:200] if sparse[i] > 0]
+            docs, per_doc = [], Counter()
+            for i in order:  # at most 2 sections per document, so one long document can't fill every slot
+                c = self.chunks[i]
+                if c["kind"] == "doc" and per_doc[c["source"]] < 2:
+                    per_doc[c["source"]] += 1
+                    docs.append(c)
+            rows = [self.chunks[i] for i in order if self.chunks[i]["kind"] == "row"]
+            if docs and rows:  # procedures first; thousands of one-line records would otherwise crowd them out
+                n_rows = min(2, len(rows))
+                return docs[:k - n_rows] + rows[:n_rows]
+            return (docs or rows)[:k]
         dense = self.vecs @ embed([query])[0]
-        sparse = self.bm25.scores(tokenize(query))
         rrf = np.zeros(len(self.chunks))
         for scores in (dense, sparse):
             for rank, i in enumerate(np.argsort(-scores)[:50]):
@@ -184,68 +395,376 @@ class Retriever:
     def lookup_ids(self, query):
         """'Agent tool': if the question has a national ID / family book no, fetch the record + linked people."""
         hits = []
-        for token in re.findall(r"FB\d+|\d{6,}", normalize(query).upper()):
+        for token in re.findall(r"[A-Z]{0,3}\d{6,}", normalize(query).upper()):
             for r in self.by_id.get(token, []):
                 if r not in hits:
                     hits.append(r)
-        # follow links one hop (spouse, father, mother) so "who is X's wife" works
+        # follow links one hop (spouse, father, mother...) so "who is X's wife" works.
+        # Generic: the first ID column of a row is its own ID; any other ID column points at someone else.
         for r in list(hits):
-            for k in ("spouse_id", "father_id", "mother_id"):
-                for linked in self.by_id.get(str(r.get(k, "")), []):
-                    if linked not in hits and str(linked.get("national_id")) == str(r.get(k)):
+            cols = id_columns(r)
+            for k in cols[1:]:
+                for linked in self.by_id.get(str(r[k]), []):
+                    own = id_columns(linked)
+                    if linked not in hits and own and str(linked[own[0]]) == str(r[k]):
                         hits.append(linked)
         return hits[:8]
 
 
-# ------------------------------------------------------------------ 6. Generation
-SYSTEM_PROMPT = """أنت مساعد ذكي لدائرة الأحوال المدنية. أجب باللغة العربية الفصحى المبسطة.
-القواعد:
-1. أجب فقط من المعلومات الموجودة في "السياق" أدناه. لا تخترع أي رقم أو رسوم أو تاريخ.
-2. إذا لم تجد الإجابة في السياق قل: "عذراً، لا تتوفر لدي هذه المعلومة." ولا تحاول التخمين.
-3. اذكر رقم المصدر بين قوسين مربعين بعد المعلومة، مثل [1].
-4. كن مختصراً وواضحاً، واستخدم نقاطاً عند ذكر الوثائق المطلوبة.
-5. إذا كتب المستخدم باللهجة العامية افهمها وأجب بالفصحى المبسطة."""
+ID_HINTS = ("id", "رقم", "هوية", "الوطني", "دفتر", "book", "no")
 
 
-def build_context(chunks, records):
-    parts = []
+def id_columns(row):
+    """Columns whose name hints at an ID AND whose value looks like one (6+ digits, or letters+digits like FB123456)."""
+    return [k for k, v in row.items() if k != "source" and any(h in k.lower() for h in ID_HINTS)
+            and re.fullmatch(r"[A-Za-z]{0,3}\d{6,}", str(v))]
+
+
+def record_label(r):
+    cols = id_columns(r)
+    return f"سجل {r[cols[0]]}" if cols else f"سجل من {r.get('source', '')}"
+
+
+# ---- people helpers (generic: work on any table with a name column and an ID column)
+NAME_SKIP = ("mother", "father", "grand", "first", "family", "office", "الام", "الاب", "الجد", "الاول", "العايله", "مكتب")
+FAMILY_WORDS = {"عيله", "عايله", "عيلت", "عشيره", "دار", "ال", "افراد", "اقارب", "كل", "جميع", "اسماء", "قرايب", "family"}
+PRETTY = {"full_name": "الاسم", "national_id": "الرقم الوطني", "birth_date": "تاريخ الميلاد", "governorate": "المحافظة",
+          "marital_status": "الحالة الاجتماعية", "is_alive": "على قيد الحياة", "gender": "الجنس"}
+TABLE_HINTS = ("birth", "ميلاد", "governorate", "محافظ", "marital", "اجتماعي", "alive", "حي")
+
+
+def name_tokens(text):
+    """Name words, normalized so العواملة = عواملة and عبد الله = عبدالله."""
+    words = normalize(text).replace("عبد ", "عبد").split()
+    return [w[2:] if w.startswith("ال") and len(w) > 4 else w for w in (re.sub(r"[^\w]", "", x) for x in words) if w]
+
+
+def loose_tokens(text):
+    """name_tokens plus each word without a glued-on و ب ل ف ك / لل (للعيلة -> عيله, لمحمد -> محمد)."""
+    q = name_tokens(text)
+    out = set(q)
+    for w in q:
+        if w.startswith("لل") and len(w) > 4:
+            out.add(w[2:])
+        elif len(w) >= 4 and w[0] in "وبلفك":
+            out.add(w[1:])
+            if w[1:].startswith("ال") and len(w) > 5:
+                out.add(w[3:])
+    return out
+
+
+def name_column(r):
+    """The full-name column: a header with name/اسم (not mother/father/office...) holding the most words."""
+    best, n = None, 1
+    for k, v in r.items():
+        kn = normalize(k)
+        if ("name" in kn or "اسم" in kn) and not any(x in kn for x in NAME_SKIP) and len(str(v).split()) > n:
+            best, n = k, len(str(v).split())
+    return best
+
+
+def name_of(r):
+    k = name_column(r)
+    return str(r[k]) if k else ""
+
+
+def is_person(r):
+    return bool(name_column(r)) and bool(id_columns(r))
+
+
+def person_id(r):
+    cols = id_columns(r)
+    return str(r[cols[0]]) if cols else ""
+
+
+def family_of(r):
+    for k, v in r.items():
+        kn = normalize(k)
+        if ("family" in kn or "عايل" in kn or "عيل" in kn or "عشير" in kn) and "book" not in kn and "دفتر" not in kn and v:
+            t = name_tokens(v)
+            return t[-1] if t else None
+    t = name_tokens(name_of(r))
+    return t[-1] if len(t) >= 2 else None
+
+
+def family_label(r):
+    for k, v in r.items():
+        kn = normalize(k)
+        if ("family" in kn or "عايل" in kn or "عيل" in kn or "عشير" in kn) and "book" not in kn and "دفتر" not in kn and v:
+            return str(v)
+    return name_of(r).split()[-1] if name_of(r) else ""
+
+
+def table_row(r):
+    """A short row for the on-screen table: name, ID and a few key columns."""
+    out = {PRETTY.get(name_column(r), "الاسم"): name_of(r), "الرقم الوطني": person_id(r)}
+    for k, v in r.items():
+        kn = normalize(k)
+        if any(h in kn for h in TABLE_HINTS) and k != name_column(r) and "place" not in kn and "مكان" not in kn:
+            out[PRETTY.get(k, k)] = v
+    return out
+
+
+def short_line(r):
+    t = table_row(r)
+    return " — ".join(f"{k}: {v}" for k, v in t.items() if v)
+
+
+# ------------------------------------------------------------------ 6. Generation (Nashmi)
+BOT_NAME = "نشمي"
+
+WELCOME = """يا هلا ومرحبا، حيّاك الله ونوّرت! 🇯🇴
+
+أنا **نشمي**، مساعدك الذكي بدائرة الأحوال المدنية. اسمي من النشامى، أهل النخوة والفزعة، وهاد بالزبط شغلي: أفزعلك وأخلّص معاملتك بسرعة وبدون ما تستنى بالدور.
+
+بقدر أساعدك بـ:
+- رسوم وأوراق الهوية، وتجديدها، وبدل الفاقد والتالف
+- تسجيل المواليد والوفيات، الزواج والطلاق، ودفتر العائلة
+- البحث عن أي شخص بالرقم الوطني أو بالاسم الكامل
+- عرض كل أفراد أي عيلة مسجلة عنا
+
+احكيلي شو بدك وبالطريقة اللي بتريحك، وأبشر بعزّك 🌿"""
+
+SYSTEM_PROMPT = """إنت «نشمي»، المساعد الذكي لدائرة الأحوال المدنية في الأردن.
+بتحكي باللهجة الأردنية البيضاء، بأسلوب مؤدب ودافي زي موظف أردني خدوم. استعمل عبارات زي: «أبشر»، «من عيوني»، «تكرم»، «حيّاك الله»، «يا غالي». ما تستعمل ألفاظ قاسية أبداً.
+
+القواعد (مهمة كتير):
+- جاوب بس من «المعلومات المتوفرة» تحت. الأرقام والرسوم والتواريخ والأسماء والأرقام الوطنية انقلها حرفياً زي ما هي.
+- إذا المعلومة مش موجودة قول: «والله يا غالي هاي المعلومة مش موجودة عندي.» وما تخمّن، وما تستعمل معلوماتك العامة.
+- اذكر رقم المصدر بعد المعلومة هيك [1].
+- إذا في «تنبيه» إنه في أكتر من شخص بنفس الاسم: احكي للمستخدم بوضوح إنه في أكتر من شخص، واذكرهم كلهم بأسمائهم وأرقامهم الوطنية، واسأله أي واحد بقصد.
+- إذا مكتوب إنه في «جدول معروض للمستخدم»: لا تعيد كتابة كل الأسماء، احكي العدد وإنه القائمة كاملة بالجدول تحت.
+- «الأشخاص اللي انحكى عنهم» هم اللي سأل عنهم المستخدم قبل بالمحادثة. إذا قال «هو» أو «إلها» أو «أبوه» أو «الأول» افهم إنه بقصد واحد منهم.
+- خليك مختصر: من جملة لتلات جمل، أو نقاط قصيرة للأوراق المطلوبة.
+
+مثال على الأسلوب: «أبشر يا غالي! رسوم تجديد الهوية 5 دنانير [1]، وإذا تأخرت في غرامة دينار عن كل شهر [1].»"""
+
+NOT_FOUND = ("والله يا غالي ما لقيت هالمعلومة عندي 🙏\n\n"
+             "بقدر أساعدك بالهوية، المواليد والوفيات، الزواج والطلاق، دفتر العائلة، "
+             "أو تدوّر على حدا بالرقم الوطني أو بالاسم الكامل.")
+
+GREET = {"مرحبا", "مرحبتين", "هلا", "اهلا", "اهلين", "السلام", "سلام", "صباح", "مسا", "مساء", "هاي", "hi", "hello", "يعطيك"}
+THANKS = {"شكرا", "مشكور", "مشكوره", "تسلم", "يسلمو", "يسلموا", "تسلملي", "thanks", "thank"}
+WHO = {"مين انت", "شو اسمك", "مين حضرتك", "عرفني عحالك", "عرف عن حالك", "انت مين", "مين نشمي"}
+ORDINALS = {"اول": 0, "ثاني": 1, "تاني": 1, "ثالث": 2, "تالت": 2, "رابع": 3, "خامس": 4, "سادس": 5}
+REFERS = {"هو", "هي", "هاد", "هذا", "هذه", "هاي", "هاظ", "الشخص", "نفسه", "نفسها", "اله", "الها", "ابوه", "امه", "ابوها",
+          "امها", "اولاده", "اولادها", "زوجته", "زوجها", "مرته", "جوزها", "عمره", "عمرها", "هويته", "هويتها", "ميلاده",
+          "ميلادها", "اخوه", "اخته", "اخواته", "ابنه", "بنته", "ابنها", "بنتها", "حالته", "حالتها", "عايش", "عايشه", "ساكن"}
+
+
+def new_memory():
+    """Per-conversation memory: who was talked about, who is 'he/she' right now, open choices between duplicates."""
+    return {"people": [], "focus": [], "candidates": [], "family": None, "family_label": None, "table": None, "warning": None}
+
+
+def _remember(memory, rows):
+    """Add people to the conversation memory; someone mentioned again moves to the end (most recent)."""
+    for r in rows:
+        pid = person_id(r)
+        if pid:
+            memory["people"] = [p for p in memory["people"] if p["id"] != pid] + [{"id": pid, "name": name_of(r)}]
+    memory["people"] = memory["people"][-12:]
+
+
+def _small_talk(question):
+    q = normalize(question)
+    words = set(re.findall(r"\w+", q))
+    if any(w in q for w in WHO):
+        return WELCOME
+    if len(words) <= 5 and words & THANKS:
+        return "العفو يا غالي، هاد واجبنا! 🌹 إذا بدك أي إشي ثاني أنا حاضر."
+    filler = {"عليكم", "ورحمه", "الله", "وبركاته", "نشمي", "الخير", "النور", "يا", "كيفك", "كيف", "الحال", "حالك",
+              "شلونك", "العافيه", "عليكو", "صباحو", "مساك"}
+    if words & GREET and not (words - GREET - filler):  # only a greeting, no question attached
+        return "يا هلا وغلا، حيّاك الله! 🌿 أنا نشمي، شو بقدر أخدمك اليوم؟"
+    return None
+
+
+def _ids_in(text):
+    return re.findall(r"[A-Z]{0,3}\d{6,}", normalize(text).upper())
+
+
+def _refers_back(question):
+    q = name_tokens(question)
+    return any(w in REFERS or (len(w) >= 4 and w.endswith(("ته", "تها", "وه", "ها", "هم"))) for w in q)
+
+
+def resolve_people(retriever, question, memory):
+    """Decide which people the question is about. Returns (records for the model, notes for the model).
+    Fills memory['table'] / memory['warning'] for the UI."""
+    notes = []
+    # 1. a national ID / family book number in the question
+    if _ids_in(question):
+        records = retriever.lookup_ids(question)
+        main = [r for r in records if is_person(r) and person_id(r) in _ids_in(question)]
+        if main:
+            memory["focus"], memory["candidates"] = [person_id(r) for r in main], []
+            _remember(memory, main)
+        return records, notes
+
+    # 2. a name written in the question
+    found = [r for r in retriever.match_names(question) if is_person(r)]
+    if len(found) == 1:
+        pid = person_id(found[0])
+        memory["focus"], memory["candidates"] = [pid], []
+        _remember(memory, found)
+        return retriever.lookup_ids(pid), notes
+    if len(found) > 1:
+        shown = found[:50]
+        memory["candidates"], memory["focus"] = [person_id(r) for r in shown], []
+        memory["table"] = [table_row(r) for r in shown]
+        memory["warning"] = f"في {len(found)} أشخاص بنفس الاسم. تأكد من الرقم الوطني قبل ما تعتمد أي معلومة."
+        _remember(memory, shown[:5])
+        notes.append(f"تنبيه: في {len(found)} أشخاص مسجلين بنفس الاسم المذكور بالسؤال. "
+                     "احكي للمستخدم إنه في أكتر من شخص، واذكرهم كلهم بأرقامهم الوطنية، واسأله أي واحد بقصد "
+                     "(بقدر يكتب الرقم الوطني أو يحكي الأول، التاني...). الجدول معروض للمستخدم كمان.\n"
+                     + "\n".join(f"{i+1}. {short_line(r)}" for i, r in enumerate(shown[:10])))
+        return [], notes
+
+    # 3. a whole family (named in the question, or "the family we talked about" from memory)
+    fam = retriever.match_family(question)
+    if not fam and memory["family"] and loose_tokens(question) & (FAMILY_WORDS - {"كل", "جميع", "اسماء", "ال", "دار"}):
+        fam = memory["family"]
+    if fam:
+        members = retriever.families[fam]
+        alive = [r for r in members if str(r.get("is_alive", "نعم")) != "لا"]
+        memory["family"], memory["candidates"], memory["focus"] = fam, [person_id(r) for r in members], []
+        memory["family_label"] = retriever.family_display.get(fam, fam)
+        memory["table"] = [table_row(r) for r in members]
+        notes.append(f"عيلة {retriever.family_display.get(fam, fam)}: عدد الأفراد المسجلين {len(members)} شخص ({len(alive)} منهم على قيد الحياة). "
+                     "القائمة الكاملة معروضة للمستخدم بجدول تحت ردّك، فلا تكتب كل الأسماء. أمثلة: "
+                     + "، ".join(name_of(r) for r in members[:5]))
+        return [], notes
+
+    # 4. "the first one / التاني" after a duplicates or family list
+    q = name_tokens(question)
+    if memory["candidates"]:
+        for w in q:
+            if w in ORDINALS and ORDINALS[w] < len(memory["candidates"]):
+                pid = memory["candidates"][ORDINALS[w]]
+                memory["focus"], memory["candidates"] = [pid], []
+                p = retriever.person(pid)
+                _remember(memory, [p] if p else [])
+                return retriever.lookup_ids(pid), notes
+
+    # 5. a first name of someone we already talked about ("وشو عن رنا؟", "ارجع لمحمد")
+    q_loose = loose_tokens(question)
+    for p in reversed(memory["people"]):
+        first = (name_tokens(p["name"]) or [""])[0]
+        if first and first in q_loose:
+            memory["focus"] = [p["id"]]
+            row = retriever.person(p["id"])
+            _remember(memory, [row] if row else [])
+            return retriever.lookup_ids(p["id"]), notes
+
+    # 6. "he / his kids / عمره" -> the person in focus
+    if memory["focus"] and _refers_back(question):
+        records = []
+        for pid in memory["focus"]:
+            records += [r for r in retriever.lookup_ids(pid) if r not in records]
+        return records, notes
+    return [], notes
+
+
+def build_context(chunks, records, notes=(), memory=None):
+    parts = [f"[{i+1}] {n}" for i, n in enumerate(notes)]
     for r in records:
-        parts.append(f"[{len(parts)+1}] (سجل مطابق تماماً للرقم المذكور)\n" + row_to_text(r))
+        parts.append(f"[{len(parts)+1}] سجل من السجل المدني:\n" + row_to_text({k: v for k, v in r.items() if k != "source"}))
     for c in chunks:
-        parts.append(f"[{len(parts)+1}] (المصدر: {c['source']})\n{c['text']}")
-    return "\n\n".join(parts)
+        parts.append(f"[{len(parts)+1}] من {c['source']}:\n{c['text']}")
+    text = "\n\n".join(parts)
+    if memory and memory["family"]:
+        text += f"\n\nآخر عيلة انحكى عنها: {memory.get('family_label') or memory['family']}"
+    if memory and memory["people"]:
+        text += "\n\nالأشخاص اللي انحكى عنهم بهالمحادثة (من الأقدم للأحدث):\n" + "\n".join(
+            f"- {p['name']} (الرقم الوطني {p['id']})" for p in memory["people"])
+    return text
 
 
-def answer(retriever, question, history=None, stream=False):
-    records = retriever.lookup_ids(question)
-    chunks = retriever.search(question)
-    context = build_context(chunks, records)
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-    messages += (history or [])[-6:]  # last 3 turns for follow-up questions
-    messages.append({"role": "user", "content": f"السياق:\n{context}\n\nالسؤال: {question}"})
-    sources = [f"سجل {r.get('national_id', '')}" for r in records] + [c["source"] for c in chunks]
+def answer(retriever, question, history=None, stream=False, memory=None):
+    """memory: a dict from new_memory(), kept by the UI for the whole chat. After the call,
+    memory['table'] (rows to show) and memory['warning'] are set for this answer."""
+    history = history or []
+    memory = memory if memory is not None else new_memory()
+    memory["table"], memory["warning"] = None, None
+
+    reply = _small_talk(question)
+    if reply:
+        return (iter([reply]) if stream else reply), [], ""
+
+    records, notes = resolve_people(retriever, question, memory)
+    # people found -> few document results, so they don't distract the model
+    chunks = retriever.search(question, k=1 if notes else (2 if records else TOP_K))
+    records = records[:8]
+    context = build_context(chunks, records, notes, memory)
+    sources = [record_label(r) for r in records] + [c["source"] for c in chunks]
+
+    if not (records or notes or chunks):
+        return (iter([NOT_FOUND]) if stream else NOT_FOUND), sources, context
+
+    # Context goes in the system message (Command R models ground best that way); last 3 turns of history.
+    messages = [{"role": "system", "content": f"{SYSTEM_PROMPT}\n\nالمعلومات المتوفرة:\n{context}"}]
+    messages += [{"role": m["role"], "content": m["content"]} for m in history[-6:]]
+    messages.append({"role": "user", "content": question})
 
     if FAKE:
-        text = "[وضع تجريبي بدون نموذج] أقرب نتيجة:\n" + (context.split("\n\n")[0] if context else "لا يوجد سياق")
+        text = "[وضع تجريبي بدون نموذج] أقرب نتيجة:\n" + context.split("\n\n")[0]
         return (iter([text]) if stream else text), sources, context
 
     import ollama
-    opts = {"temperature": 0.1, "num_ctx": 8192}
+    # smaller context window + capped answer length = much faster on a laptop; keep_alive keeps the model in memory
+    opts = {"temperature": 0.2, "num_ctx": 4096, "num_predict": 400}
+    if NUM_GPU is not None:
+        opts["num_gpu"] = int(NUM_GPU)
     if stream:
-        gen = (p["message"]["content"] for p in ollama.chat(model=LLM_MODEL, messages=messages, stream=True, options=opts))
+        gen = (p["message"]["content"] for p in ollama.chat(model=LLM_MODEL, messages=messages, stream=True, options=opts, keep_alive="60m"))
         return gen, sources, context
-    out = ollama.chat(model=LLM_MODEL, messages=messages, options=opts)["message"]["content"]
+    out = ollama.chat(model=LLM_MODEL, messages=messages, options=opts, keep_alive="60m")["message"]["content"]
     return out, sources, context
 
 
+def warmup():
+    """Load the chat model into memory once, so the first real question isn't the slow one."""
+    if FAKE:
+        return
+    import ollama
+    ollama.chat(model=LLM_MODEL, messages=[{"role": "user", "content": "مرحبا"}],
+                options={"num_ctx": 4096, "num_predict": 1, **({"num_gpu": int(NUM_GPU)} if NUM_GPU is not None else {})},
+                keep_alive="60m")
+
+
 # ------------------------------------------------------------------ 7. CLI + eval
-def run_eval(retriever, path=os.path.join(DATA_DIR, "eval_questions.json")):
-    qs = json.load(open(path, encoding="utf-8"))
+def load_eval(data_dir=DATA_DIR):
+    """Test questions from eval_questions.json, or from any Excel sheet whose name starts with 'eval'.
+    Excel columns: question, expected_answer, source (optional) - or just the first two columns."""
+    path = os.path.join(data_dir, "eval_questions.json")
+    if os.path.exists(path):
+        return json.load(open(path, encoding="utf-8"))
+    qs = []
+    for x in glob.glob(os.path.join(data_dir, "**", "*.xls*"), recursive=True):
+        for sheet, rows in read_excel_sheets(x):
+            if not sheet.strip().lower().startswith("eval"):
+                continue
+            for r in rows:
+                vals = list(r.values())
+                q = r.get("question", vals[0] if vals else "")
+                a = r.get("expected_answer", vals[1] if len(vals) > 1 else "")
+                if q:
+                    qs.append({"q": q, "a": a, "source": r.get("source", "")})
+    return qs
+
+
+def run_eval(retriever, data_dir=DATA_DIR):
+    qs = load_eval(data_dir)
+    if not qs:
+        print("no test questions found: add data/eval_questions.json or an Excel sheet named eval_questions")
+        return
     hit = 0
     for q in qs:
         out, sources, ctx = answer(retriever, q["q"])
-        expected_in_ctx = q["source"] == "none" or any(s.startswith(q["source"]) or q["source"] in s for s in sources) \
-            or normalize(q["a"])[:12] in normalize(ctx)
+        src, ans = str(q.get("source", "")), str(q.get("a", ""))
+        expected_in_ctx = src == "none" or (src and any(s.startswith(src) or src in s for s in sources)) \
+            or (ans and normalize(ans)[:12] in normalize(ctx))
         hit += expected_in_ctx
         print(f"\nQ: {q['q']}\n  expected: {q['a']}\n  got: {str(out)[:300]}\n  retrieval {'OK' if expected_in_ctx else 'MISS'}")
     print(f"\nretrieval hit-rate: {hit}/{len(qs)}  (read the answers yourself to judge correctness)")
@@ -259,6 +778,6 @@ if __name__ == "__main__":
         out, src, _ = answer(Retriever(), " ".join(sys.argv[2:]))
         print(out, "\n\nsources:", src)
     elif cmd == "eval":
-        run_eval(Retriever())
+        run_eval(Retriever(), sys.argv[2] if len(sys.argv) > 2 else DATA_DIR)
     else:
         print(__doc__)

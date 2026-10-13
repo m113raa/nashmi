@@ -1,5 +1,8 @@
-ollama>=0.4
+ollama
 numpy
-streamlit>=1.38
+openpyxl
+pandas
+xlrd
 pypdf
 python-docx
+streamlit
