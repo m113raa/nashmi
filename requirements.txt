@@ -1,0 +1,5 @@
+ollama>=0.4
+numpy
+streamlit>=1.38
+pypdf
+python-docx

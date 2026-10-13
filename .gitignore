@@ -1,0 +1,5 @@
+index.pkl
+__pycache__/
+*.pyc
+.venv/
+data_real/
