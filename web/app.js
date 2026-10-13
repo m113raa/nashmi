@@ -17,7 +17,8 @@
     state.convs.forEach(function (c) {  // an answer cut off by a page reload
       c.messages.forEach(function (m) { if (m.pending) { m.pending = false; if (!m.content) m.error = "انقطع الرد. اسأل كمان مرة."; } });
     });
-    if (!active()) newConversation();
+    state.convs = state.convs.filter(function (c) { return c.messages.length; });
+    newConversation();
   }
 
   function save() {
