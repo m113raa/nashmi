@@ -2,9 +2,19 @@
 rag.py - Arabic RAG core (Ollama + command-r7b-arabic + bge-m3), hybrid search, ID lookup tool.
 
 Commands:
-  python rag.py ingest [data_dir]   build the index from every .xlsx/.xls/.csv/.json/.md/.txt/.pdf/.docx in data_dir
-  python rag.py ask "سؤالك"         ask one question in the terminal
-  python rag.py eval [data_dir]     run the test questions (eval_questions.json or an Excel 'eval...' sheet)
+  python rag.py ingest [source ...]  build the index. A source is a folder, a single file, or a database URL:
+                                       folder/file: .xlsx .xlsm .xls .ods .csv .tsv .json .jsonl .md .txt .html .pdf .docx
+                                                    .db .sqlite .sqlite3 (SQLite: every table and view)
+                                       database:    postgresql://user:pass@host/db, mysql+pymysql://..., mssql+pyodbc://...
+                                                    (needs: pip install sqlalchemy + the driver). Or set DB_URL.
+  python rag.py ask "سؤالك"          ask one question in the terminal
+  python rag.py eval [data_dir]      run the test questions (eval_questions.json or an Excel 'eval...' sheet)
+  python rag.py models               list the chat models installed in Ollama
+
+Model: any Ollama chat model works (7B/8B ones like command-r7b-arabic, qwen2.5:7b, llama3.1:8b, aya-expanse:8b).
+       LLM_MODEL=qwen2.5:7b   pick the model. If it isn't installed, an installed chat model is used instead.
+       NUM_CTX=4096           context window. The prompt is trimmed to fit, so the rules in the system
+                              prompt are never cut off. Raise it (8192) if you have the RAM/VRAM.
 
 Excel: every sheet is read as a table (header row found automatically, IDs and dates cleaned).
        Sheets named README / notes / eval... are not indexed. A cell longer than 400 characters
@@ -32,6 +42,10 @@ FAKE = os.getenv("RAG_FAKE") == "1"
 SEARCH_MODE = os.getenv("SEARCH_MODE", "fast")
 # Set NUM_GPU=0 to run the model on the CPU only (fixes "CUDA error" crashes on some laptops; slower)
 NUM_GPU = os.getenv("NUM_GPU")
+NUM_CTX = int(os.getenv("NUM_CTX", "4096"))
+NUM_PREDICT = int(os.getenv("NUM_PREDICT", "400"))
+DB_URL = os.getenv("DB_URL")  # optional: also index this database on ingest
+MAX_DB_ROWS = int(os.getenv("MAX_DB_ROWS", "200000"))  # per table, so a huge log table can't eat all the RAM
 
 # ------------------------------------------------------------------ 1. Arabic normalization
 _DIACRITICS = re.compile(r"[ؐ-ًؚ-ٰٟۖ-ۭـ]")  # tashkeel + tatweel
@@ -101,6 +115,19 @@ def tokenize(text, expand=False):
 
 
 # ------------------------------------------------------------------ 2. Loading + chunking
+def split_text(text, max_chars):
+    """Cut long text into pieces of at most max_chars, at a paragraph / line / word break, never mid-word."""
+    out = []
+    while len(text) > max_chars:
+        cut = max(text.rfind("\n\n", 0, max_chars), text.rfind("\n", 0, max_chars), text.rfind(" ", 0, max_chars))
+        cut = cut if cut > max_chars // 3 else max_chars
+        out.append(text[:cut].strip())
+        text = text[cut:].strip()
+    if text.strip():
+        out.append(text.strip())
+    return [p for p in out if p]
+
+
 def chunk_markdown(text, source, max_chars=1200):
     """Split on headings so each chunk is one topic; keep the doc title on every chunk for context."""
     title = next((l.lstrip("# ").strip() for l in text.splitlines() if l.startswith("# ")), source)
@@ -111,8 +138,8 @@ def chunk_markdown(text, source, max_chars=1200):
         if not p:
             continue
         body = p if p.startswith("# ") else f"{title}\n{p}"
-        for i in range(0, len(body), max_chars):  # hard cap for very long sections
-            chunks.append({"text": body[i:i + max_chars], "source": source, "kind": "doc"})
+        for piece in split_text(body, max_chars):  # hard cap for very long sections
+            chunks.append({"text": piece, "source": source, "kind": "doc"})
     return chunks
 
 
@@ -134,12 +161,28 @@ def read_text_file(path):
 
 
 def load_table_rows(path):
-    if path.lower().endswith(".csv"):
-        import io
-        return list(csv.DictReader(io.StringIO(read_text_file(path))))
-    with open(path, encoding="utf-8") as f:
-        data = json.load(f)
-    return data if isinstance(data, list) and data and isinstance(data[0], dict) else None
+    """CSV / TSV / JSON / JSONL -> list of row dicts, or None if the file isn't a table."""
+    import io
+    ext = path.lower().rsplit(".", 1)[-1]
+    text = read_text_file(path)
+    if ext in ("csv", "tsv"):
+        delim = "\t"
+        if ext == "csv":  # Excel in Arabic/European locales saves CSV with ; instead of ,
+            try:
+                delim = csv.Sniffer().sniff(text[:4096], delimiters=",;\t|").delimiter
+            except csv.Error:
+                delim = ","
+        rows = list(csv.DictReader(io.StringIO(text), delimiter=delim))
+        return [{str(k or f"column_{i+1}").strip(): cell_to_str(v) for i, (k, v) in enumerate(r.items())} for r in rows]
+    if ext == "jsonl":
+        data = [json.loads(l) for l in text.splitlines() if l.strip()]
+    else:
+        data = json.loads(text)
+    if isinstance(data, dict):  # {"records": [...]} / {"data": [...]}: use the first list of objects inside
+        data = next((v for v in data.values() if isinstance(v, list) and v and isinstance(v[0], dict)), data)
+    if not (isinstance(data, list) and data and isinstance(data[0], dict)):
+        return None
+    return [{str(k): cell_to_str(v) for k, v in r.items()} for r in data if isinstance(r, dict)]
 
 
 # ---- Excel ------------------------------------------------------------------------------
@@ -148,23 +191,28 @@ LONG_TEXT = 400  # a cell longer than this is a document (procedure text), not a
 
 
 def cell_to_str(v):
-    """Excel stores IDs as numbers and dates as datetimes. Turn them back into clean text."""
+    """Excel / databases store IDs as numbers and dates as datetimes. Turn them back into clean text."""
     import datetime
-    if v is None:
+    if v is None or isinstance(v, (bytes, bytearray, memoryview)):  # BLOBs (images, files) can't be searched
         return ""
     if isinstance(v, datetime.datetime):
         return v.date().isoformat() if v.time() == datetime.time(0) else v.isoformat(sep=" ", timespec="minutes")
     if isinstance(v, datetime.date):
         return v.isoformat()
-    if isinstance(v, float) and v.is_integer():
-        return str(int(v))  # 9040250165.0 -> "9040250165", never "9.04e9"
+    if isinstance(v, float):
+        if v != v:  # NaN from pandas = empty cell
+            return ""
+        if v.is_integer():
+            return str(int(v))  # 9040250165.0 -> "9040250165", never "9.04e9"
+    if isinstance(v, (dict, list)):  # nested JSON / JSON database columns
+        return json.dumps(v, ensure_ascii=False)
     return str(v).strip()
 
 
 def read_excel_sheets(path):
     """Yield (sheet_name, rows as dicts) for every sheet that holds a table."""
-    if path.lower().endswith(".xls"):
-        import pandas as pd  # old .xls needs pandas + xlrd
+    if path.lower().endswith((".xls", ".ods")):
+        import pandas as pd  # old .xls needs pandas + xlrd, .ods needs pandas + odfpy
         for sheet, df in pd.read_excel(path, sheet_name=None, header=None, dtype=object).items():
             yield sheet, table_from_grid(df.where(df.notna(), None).values.tolist())
         return
@@ -195,63 +243,211 @@ def table_from_grid(grid):
     return rows
 
 
+def rows_to_chunks(rows, source):
+    """Any table (Excel sheet, CSV, JSON, database table) -> (chunks, records).
+    A row with a long text cell is a document and gets chunked; any other row is one record."""
+    chunks, records = [], []
+    for i, r in enumerate(rows):
+        long_cols = [k for k, v in r.items() if len(v) > LONG_TEXT or (len(v) > 150 and "\n" in v)]
+        if long_cols:  # e.g. a 'content' column with a whole procedure: chunk it like a document
+            short = [v for k, v in r.items() if k not in long_cols and v]
+            label = " | ".join(short)
+            doc_source = f"{source} › {short[0]}" if short else f"{source} › {i+1}"  # cite the doc, not just the table
+            for k in long_cols:
+                for c in chunk_markdown(r[k], doc_source):
+                    c["text"] = f"{label}\n{c['text']}" if label else c["text"]
+                    chunks.append(c)
+        else:
+            chunks.append({"text": f"[{source} سجل {i+1}]\n" + row_to_text(r), "source": source, "kind": "row"})
+            records.append({"source": source, **r})
+    return chunks, records
+
+
 def load_excel(path, name):
     chunks, records = [], []
     for sheet, rows in read_excel_sheets(path):
         s = sheet.strip().lower()
         if not rows or s in SKIP_SHEETS or s.startswith("eval"):
             continue
-        source = f"{name} › {sheet}"
-        for i, r in enumerate(rows):
-            long_cols = [k for k, v in r.items() if len(v) > LONG_TEXT or (len(v) > 150 and "\n" in v)]
-            if long_cols:  # e.g. a 'content' column with a whole procedure: chunk it like a document
-                short = [v for k, v in r.items() if k not in long_cols and v]
-                label = " | ".join(short)
-                doc_source = f"{source} › {short[0]}" if short else f"{source} › {i+1}"  # cite the doc, not just the sheet
-                for k in long_cols:
-                    for c in chunk_markdown(r[k], doc_source):
-                        c["text"] = f"{label}\n{c['text']}" if label else c["text"]
-                        chunks.append(c)
-            else:
-                chunks.append({"text": f"[{source} سجل {i+1}]\n" + row_to_text(r), "source": source, "kind": "row"})
-                records.append({"source": source, **r})
-        print(f"  {source}: {len(rows)} rows")
+        c, r = rows_to_chunks(rows, f"{name} › {sheet}")
+        chunks += c
+        records += r
+        print(f"  {name} › {sheet}: {len(rows)} rows")
     return chunks, records
 
 
-def load_documents(data_dir=DATA_DIR):
+# ---- Databases ---------------------------------------------------------------------------
+def hide_password(url):
+    return re.sub(r"(://[^:/@]+):[^@]*@", r"\1:***@", url)
+
+
+def load_sqlite(path, name):
+    """Every table and view of a SQLite file. Standard library only, opened read-only."""
+    import pathlib, sqlite3
+    con = sqlite3.connect(pathlib.Path(path).resolve().as_uri() + "?mode=ro", uri=True)
     chunks, records = [], []
-    for path in sorted(glob.glob(os.path.join(data_dir, "**", "*"), recursive=True)):
-        name = os.path.relpath(path, data_dir)
+    try:
+        tables = [t for (t,) in con.execute(
+            "SELECT name FROM sqlite_master WHERE type IN ('table','view') AND name NOT LIKE 'sqlite_%' ORDER BY name")]
+        for t in tables:
+            cur = con.execute(f'SELECT * FROM "{t.replace(chr(34), chr(34) * 2)}" LIMIT ?', (MAX_DB_ROWS,))
+            cols = [d[0] for d in cur.description]
+            rows = [r for r in ({c: cell_to_str(v) for c, v in zip(cols, row)} for row in cur) if any(r.values())]
+            c, r = rows_to_chunks(rows, f"{name} › {t}")
+            chunks += c
+            records += r
+            print(f"  {name} › {t}: {len(rows)} rows")
+    finally:
+        con.close()
+    return chunks, records
+
+
+def load_sql_database(url):
+    """Any database SQLAlchemy can reach (PostgreSQL, MySQL/MariaDB, SQL Server, Oracle, SQLite...).
+    Reads every table and view, at most MAX_DB_ROWS rows each. Read-only: only SELECTs are sent."""
+    try:
+        from sqlalchemy import MetaData, Table, create_engine, inspect, select
+    except ImportError:
+        raise RuntimeError("to read a database URL install SQLAlchemy and the driver, e.g. "
+                           "pip install sqlalchemy 'psycopg[binary]'   (PostgreSQL)  /  pymysql (MySQL)  /  pyodbc (SQL Server)")
+    engine = create_engine(url)
+    insp = inspect(engine)
+    db_name = engine.url.database or engine.url.host or "database"
+    db_name = os.path.basename(str(db_name))
+    chunks, records = [], []
+    with engine.connect() as con:
+        for t in insp.get_table_names() + insp.get_view_names():
+            try:
+                table = Table(t, MetaData(), autoload_with=engine)
+                result = con.execute(select(table).limit(MAX_DB_ROWS))
+                cols = list(result.keys())
+                rows = [r for r in ({c: cell_to_str(v) for c, v in zip(cols, row)} for row in result) if any(r.values())]
+            except Exception as e:
+                print(f"!! skipped table {t}: {e}")
+                continue
+            c, r = rows_to_chunks(rows, f"{db_name} › {t}")
+            chunks += c
+            records += r
+            print(f"  {db_name} › {t}: {len(rows)} rows")
+    engine.dispose()
+    return chunks, records
+
+
+# ---- PDF / Word / HTML -------------------------------------------------------------------
+def load_pdf(path, name):
+    """Text of every page, chunked page by page so answers can cite the page number."""
+    from pypdf import PdfReader
+    pages = [(pg.extract_text() or "").strip() for pg in PdfReader(path).pages]
+    if sum(len(p) for p in pages) < 20 * max(1, len(pages)):
+        print(f"!! {name}: almost no text found - it is probably a scanned PDF (images). "
+              "Run it through OCR first (e.g. ocrmypdf in.pdf out.pdf), then ingest the new file.")
+    chunks = []
+    for n, text in enumerate(pages, 1):
+        for c in chunk_markdown(text, name):
+            c["text"] = f"(صفحة {n})\n{c['text']}"
+            chunks.append(c)
+    return chunks
+
+
+def load_docx(path, name):
+    """Paragraphs as a document, and every table in the Word file as table rows."""
+    import docx
+    d = docx.Document(path)
+    # Word headings -> markdown headings, so chunk_markdown splits by topic
+    lines = [("## " if p.style is not None and p.style.name.lower().startswith("heading") else "") + p.text
+             for p in d.paragraphs if p.text.strip()]
+    chunks, records = chunk_markdown("\n".join(lines), name), []
+    for i, t in enumerate(d.tables, 1):
+        grid = [[cell.text for cell in row.cells] for row in t.rows]
+        c, r = rows_to_chunks(table_from_grid(grid), f"{name} › جدول {i}")
+        chunks += c
+        records += r
+    return chunks, records
+
+
+def html_to_text(html):
+    from html.parser import HTMLParser
+
+    class P(HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self.out, self.skip = [], 0
+
+        def handle_starttag(self, tag, attrs):
+            if tag in ("script", "style"):
+                self.skip += 1
+            elif tag in ("h1", "h2", "h3"):
+                self.out.append("\n## ")
+            elif tag in ("p", "br", "div", "li", "tr"):
+                self.out.append("\n")
+
+        def handle_endtag(self, tag):
+            if tag in ("script", "style"):
+                self.skip -= 1
+
+        def handle_data(self, data):
+            if not self.skip:
+                self.out.append(data)
+
+    p = P()
+    p.feed(html)
+    return re.sub(r"\n\s*\n+", "\n\n", "".join(p.out)).strip()
+
+
+# ---- One loader for everything -----------------------------------------------------------
+TABLE_EXT = ("csv", "tsv", "json", "jsonl")
+EXCEL_EXT = ("xlsx", "xlsm", "xls", "ods")
+DB_EXT = ("db", "sqlite", "sqlite3")
+
+
+def load_file(path, name):
+    """One file -> (chunks, records). Unknown file types return nothing."""
+    ext = path.lower().rsplit(".", 1)[-1]
+    if ext in ("md", "txt"):
+        return chunk_markdown(read_text_file(path), name), []
+    if ext in ("html", "htm"):
+        return chunk_markdown(html_to_text(read_text_file(path)), name), []
+    if ext in EXCEL_EXT:
+        return load_excel(path, name)
+    if ext in TABLE_EXT:
+        if ext == "json" and os.path.exists(path[:-5] + ".csv"):
+            return [], []  # same table already loaded from CSV
+        rows = load_table_rows(path)
+        if rows is None:  # JSON that isn't a table: index it as text
+            return chunk_markdown(read_text_file(path), name), []
+        print(f"  {name}: {len(rows)} rows")
+        return rows_to_chunks(rows, name)
+    if ext in DB_EXT:
+        return load_sqlite(path, name)
+    if ext == "pdf":
+        return load_pdf(path, name), []
+    if ext == "docx":
+        return load_docx(path, name)
+    return [], []
+
+
+def load_documents(data_dir=DATA_DIR):
+    """data_dir can be a folder (searched recursively), a single file, or a database URL (has '://')."""
+    if "://" in str(data_dir):
+        try:
+            return load_sql_database(data_dir)
+        except Exception as e:
+            print(f"!! could not read database {hide_password(data_dir)}: {e}")
+            return [], []
+    if os.path.isfile(data_dir):
+        paths, root = [data_dir], os.path.dirname(data_dir)
+    else:
+        paths, root = sorted(glob.glob(os.path.join(data_dir, "**", "*"), recursive=True)), data_dir
+    chunks, records = [], []
+    for path in paths:
+        name = os.path.relpath(path, root)
         base = os.path.basename(path)
         if os.path.isdir(path) or base.startswith("eval_") or base.startswith("~$"):  # ~$ = Excel lock file
             continue
-        ext = path.lower().rsplit(".", 1)[-1]
         try:
-            if ext in ("md", "txt"):
-                chunks += chunk_markdown(read_text_file(path), name)
-            elif ext in ("xlsx", "xlsm", "xls"):
-                c, r = load_excel(path, name)
-                chunks += c
-                records += r
-            elif ext in ("csv", "json"):
-                if ext == "json" and os.path.exists(path[:-5] + ".csv"):
-                    continue  # same table already loaded from CSV
-                rows = load_table_rows(path)
-                if rows is None:  # JSON that isn't a table: index it as text
-                    chunks += chunk_markdown(read_text_file(path), name)
-                    continue
-                for i, r in enumerate(rows):
-                    chunks.append({"text": f"[{name} سجل {i+1}]\n" + row_to_text(r), "source": name, "kind": "row"})
-                    records.append({"source": name, **r})
-            elif ext == "pdf":
-                from pypdf import PdfReader
-                text = "\n".join((pg.extract_text() or "") for pg in PdfReader(path).pages)
-                chunks += chunk_markdown(text, name)
-            elif ext == "docx":
-                import docx
-                text = "\n".join(p.text for p in docx.Document(path).paragraphs)
-                chunks += chunk_markdown(text, name)
+            c, r = load_file(path, name)
+            chunks += c
+            records += r
         except Exception as e:
             print(f"!! skipped {name}: {e}")
     return chunks, records
@@ -302,14 +498,23 @@ class BM25:
 
 # ------------------------------------------------------------------ 5. Index build / load
 def build_index(data_dir=DATA_DIR, path=INDEX_PATH):
-    chunks, records = load_documents(data_dir)
-    print(f"loaded {len(chunks)} chunks, {len(records)} table rows from {data_dir}")
+    """data_dir: one source or a list of them (folders, files, database URLs). DB_URL is always added."""
+    sources = [data_dir] if isinstance(data_dir, str) else list(data_dir)
+    if DB_URL and DB_URL not in sources:
+        sources.append(DB_URL)
+    chunks, records = [], []
+    for src in sources:
+        c, r = load_documents(src)
+        chunks += c
+        records += r
+    shown = ", ".join(hide_password(s) for s in sources)  # never write a DB password into the index or the log
+    print(f"loaded {len(chunks)} chunks, {len(records)} table rows from {shown}")
     if not chunks:
-        print("!! nothing loaded - check the folder name and that it contains .xlsx/.csv/.md files")
+        print("!! nothing loaded - check the folder name / database URL and that it holds supported files")
         return
     vecs = embed([c["text"] for c in chunks]) if SEARCH_MODE == "hybrid" or FAKE else None
     with open(path, "wb") as f:
-        pickle.dump({"chunks": chunks, "records": records, "vecs": vecs, "data_dir": data_dir,
+        pickle.dump({"chunks": chunks, "records": records, "vecs": vecs, "data_dir": shown,
                      "emb_model": "fake" if FAKE else (EMB_MODEL if vecs is not None else "none (fast mode)")}, f)
     print(f"index saved -> {path}  (search mode: {SEARCH_MODE})")
 
@@ -696,15 +901,17 @@ def answer(retriever, question, history=None, stream=False, memory=None):
     # people found -> few document results, so they don't distract the model
     chunks = retriever.search(question, k=1 if notes else (2 if records else TOP_K))
     records = records[:8]
+    history = [{"role": m["role"], "content": m["content"]} for m in history[-6:]]  # last 3 turns
+    chunks, records, history = fit_to_window(chunks, records, notes, memory, history, question)
     context = build_context(chunks, records, notes, memory)
     sources = [record_label(r) for r in records] + [c["source"] for c in chunks]
 
     if not (records or notes or chunks):
         return (iter([NOT_FOUND]) if stream else NOT_FOUND), sources, context
 
-    # Context goes in the system message (Command R models ground best that way); last 3 turns of history.
+    # Context goes in the system message (Command R models ground best that way, and every Ollama chat model accepts it)
     messages = [{"role": "system", "content": f"{SYSTEM_PROMPT}\n\nالمعلومات المتوفرة:\n{context}"}]
-    messages += [{"role": m["role"], "content": m["content"]} for m in history[-6:]]
+    messages += history
     messages.append({"role": "user", "content": question})
 
     if FAKE:
@@ -712,15 +919,107 @@ def answer(retriever, question, history=None, stream=False, memory=None):
         return (iter([text]) if stream else text), sources, context
 
     import ollama
-    # smaller context window + capped answer length = much faster on a laptop; keep_alive keeps the model in memory
-    opts = {"temperature": 0.2, "num_ctx": 4096, "num_predict": 400}
+    model = chat_model()
+    if stream:
+        gen = (p["message"]["content"] for p in ollama.chat(model=model, messages=messages, stream=True, options=llm_options(), keep_alive="60m"))
+        return gen, sources, context
+    out = ollama.chat(model=model, messages=messages, options=llm_options(), keep_alive="60m")["message"]["content"]
+    return out, sources, context
+
+
+# ---- model settings (any 7B/8B Ollama model) --------------------------------------------
+# 7B tokenizers spend more tokens on Arabic than on English (often 1 token per 2-3 letters).
+# Count 2 letters per token so the estimate errs on the safe side.
+CHARS_PER_TOKEN = float(os.getenv("CHARS_PER_TOKEN", "2"))
+EMBEDDING_FAMILIES = ("bert", "nomic-bert", "xlm-roberta")
+_MODEL = {"name": None}
+
+
+def approx_tokens(text):
+    return int(len(text) / CHARS_PER_TOKEN) + 4
+
+
+def fit_to_window(chunks, records, notes, memory, history, question):
+    """When a prompt is longer than num_ctx, Ollama silently cuts it from the START, which is the system
+    prompt with the rules - a 7B model then answers without them. So trim here instead, least useful
+    first: old chat turns, then the lowest-ranked search results, then extra records."""
+    chunks, records, history = list(chunks), list(records), list(history)
+    budget = NUM_CTX - NUM_PREDICT - 64
+
+    def size():
+        ctx = build_context(chunks, records, notes, memory)
+        return approx_tokens(SYSTEM_PROMPT) + approx_tokens(ctx) + approx_tokens(question) \
+            + sum(approx_tokens(m["content"]) for m in history)
+
+    while size() > budget:
+        if history:
+            history = history[2:]  # drop the oldest question + answer
+        elif len(chunks) > 1:
+            chunks.pop()
+        elif len(records) > 1:
+            records.pop()
+        elif chunks and records:
+            chunks.pop()
+        else:  # one huge chunk or record: shorten its text
+            items = chunks or records
+            if not items:
+                break
+            over = int((size() - budget) * CHARS_PER_TOKEN) + 20
+            if chunks:
+                c = chunks[0]
+                if len(c["text"]) <= over:
+                    break
+                chunks[0] = {**c, "text": c["text"][:len(c["text"]) - over]}
+            else:
+                r = records[0]
+                text = row_to_text({k: v for k, v in r.items() if k != "source"})
+                if len(text) <= over:
+                    break
+                records[0] = {"source": r.get("source", ""), "سجل": text[:len(text) - over]}
+    return chunks, records, history
+
+
+def llm_options():
+    # smaller context window + capped answer length = much faster on a laptop
+    opts = {"temperature": 0.2, "num_ctx": NUM_CTX, "num_predict": NUM_PREDICT}
     if NUM_GPU is not None:
         opts["num_gpu"] = int(NUM_GPU)
-    if stream:
-        gen = (p["message"]["content"] for p in ollama.chat(model=LLM_MODEL, messages=messages, stream=True, options=opts, keep_alive="60m"))
-        return gen, sources, context
-    out = ollama.chat(model=LLM_MODEL, messages=messages, options=opts, keep_alive="60m")["message"]["content"]
-    return out, sources, context
+    return opts
+
+
+def installed_chat_models():
+    """Chat models pulled in Ollama (embedding models like bge-m3 are left out)."""
+    import ollama
+    out = []
+    for m in ollama.list().models:
+        family = (m.details.family if m.details else "") or ""
+        if family in EMBEDDING_FAMILIES or "embed" in m.model:
+            continue
+        out.append((m.model, m.details.parameter_size if m.details else ""))
+    return out
+
+
+def chat_model():
+    """LLM_MODEL if it is installed, otherwise the installed chat model closest to 7B, so the app
+    still starts after switching machines or models. Raises a clear error if there is none."""
+    if _MODEL["name"]:
+        return _MODEL["name"]
+    models = installed_chat_models()
+    names = [n for n, _ in models]
+    want = LLM_MODEL if ":" in LLM_MODEL else LLM_MODEL + ":latest"
+    if want in names or LLM_MODEL in names:
+        _MODEL["name"] = LLM_MODEL
+    elif models:
+        def dist_to_7b(m):
+            size = re.match(r"([\d.]+)\s*([BM])", m[1] or "", re.I)
+            billions = float(size.group(1)) / (1000 if size.group(2).upper() == "M" else 1) if size else 99
+            return abs(billions - 7)
+        _MODEL["name"] = min(models, key=dist_to_7b)[0]
+        print(f"!! model '{LLM_MODEL}' is not installed - using '{_MODEL['name']}' instead "
+              f"(install it with: ollama pull {LLM_MODEL})")
+    else:
+        raise RuntimeError(f"no chat model installed in Ollama - run: ollama pull {LLM_MODEL}")
+    return _MODEL["name"]
 
 
 def warmup():
@@ -728,9 +1027,8 @@ def warmup():
     if FAKE:
         return
     import ollama
-    ollama.chat(model=LLM_MODEL, messages=[{"role": "user", "content": "مرحبا"}],
-                options={"num_ctx": 4096, "num_predict": 1, **({"num_gpu": int(NUM_GPU)} if NUM_GPU is not None else {})},
-                keep_alive="60m")
+    ollama.chat(model=chat_model(), messages=[{"role": "user", "content": "مرحبا"}],
+                options={**llm_options(), "num_predict": 1}, keep_alive="60m")
 
 
 # ------------------------------------------------------------------ 7. CLI + eval
@@ -773,11 +1071,14 @@ def run_eval(retriever, data_dir=DATA_DIR):
 if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else "help"
     if cmd == "ingest":
-        build_index(sys.argv[2] if len(sys.argv) > 2 else DATA_DIR)
+        build_index(sys.argv[2:] or DATA_DIR)
     elif cmd == "ask":
         out, src, _ = answer(Retriever(), " ".join(sys.argv[2:]))
         print(out, "\n\nsources:", src)
     elif cmd == "eval":
         run_eval(Retriever(), sys.argv[2] if len(sys.argv) > 2 else DATA_DIR)
+    elif cmd == "models":
+        for n, size in installed_chat_models():
+            print(f"  {n:40} {size}{'   <- LLM_MODEL' if n.split(':')[0] == LLM_MODEL.split(':')[0] else ''}")
     else:
         print(__doc__)
