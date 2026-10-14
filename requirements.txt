@@ -6,3 +6,9 @@ xlrd
 pypdf
 python-docx
 streamlit
+
+# databases (SQLite files need none of these)
+sqlalchemy
+psycopg[binary]   # PostgreSQL
+pymysql           # MySQL / MariaDB
+pyodbc            # SQL Server

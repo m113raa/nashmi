@@ -110,7 +110,7 @@ class Handler(BaseHTTPRequestHandler):
         files = Counter(c["source"].split(" › ")[0] for c in r.chunks) if r else {}
         self.send_json({
             "model": STATE["model"] if not rag.FAKE else "ready",
-            "model_name": rag.LLM_MODEL,
+            "model_name": rag._MODEL["name"] or rag.LLM_MODEL,  # the model actually in use (may be a fallback)
             "model_error": STATE["model_error"],
             "fake": rag.FAKE,
             "index": bool(r),
@@ -194,7 +194,7 @@ def main():
     mimetypes.add_type("application/javascript", ".js")
     mimetypes.add_type("text/css", ".css")
     if retriever() is None:
-        print("!! no index.pkl yet - run:  py rag.py ingest data_excel")
+        print("!! no index.pkl yet - run:  py rag.py ingest data_excel   (a folder, a file, or a database URL)")
     if not rag.FAKE:
         threading.Thread(target=warm_up_loop, daemon=True).start()
     url = f"http://localhost:{a.port}"
